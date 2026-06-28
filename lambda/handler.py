@@ -3,12 +3,14 @@ import subprocess
 import os
 import json
 import logging
+import base64
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 ecs_client = boto3.client("ecs")
 sns_client = boto3.client("sns")
+ecr = boto3.client("ecr")
 
 PUBLIC_KEY_PATH = "/var/task/cosign.pub"
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
@@ -20,6 +22,33 @@ def verify_image(image: str) -> tuple[bool, str]:
     Returns (success: bool, output: str)
     """
     try:
+        auth_data = ecr.get_authorization_token()["authorizationData"][0]
+
+        registry = auth_data["proxyEndpoint"].replace("https://", "")
+
+        username, password = base64.b64decode(
+            auth_data["authorizationToken"]
+        ).decode().split(":")
+
+        docker_config = {
+            "auths": {
+                registry: {
+                    "auth": base64.b64encode(
+                        f"{username}:{password}".encode()
+                    ).decode()
+                }
+            }
+        }
+
+        docker_dir = "/tmp/.docker"
+        os.makedirs(docker_dir, exist_ok=True)
+
+        with open(f"{docker_dir}/config.json", "w") as f:
+            json.dump(docker_config, f)
+
+        env = os.environ.copy()
+        env["DOCKER_CONFIG"] = docker_dir
+        logger.info("Successfully obtained ECR auth token")
         result = subprocess.run(
             [
                 "/usr/local/bin/cosign",
@@ -28,6 +57,7 @@ def verify_image(image: str) -> tuple[bool, str]:
                 "--insecure-ignore-tlog",   # skip Rekor transparency log (offline verify)
                 image,
             ],
+            env=env,
             capture_output=True,
             text=True,
             timeout=30,

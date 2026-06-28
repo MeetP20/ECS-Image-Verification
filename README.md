@@ -1,4 +1,4 @@
-# 🔐 Cosign ECS Image Verifier
+# 🔐 ECS-Image-Verification
 
 > **Plug-in security layer for all your Amazon ECS clusters in a region.**  
 > Deploy this once and every container across every ECS cluster in the region is automatically verified against a Cosign signature. Unsigned containers are stopped instantly and your team is alerted via email.
