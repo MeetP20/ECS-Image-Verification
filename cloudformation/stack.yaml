@@ -1,0 +1,218 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Cosign ECS Image Verification — Plug-in Stack.
+  Monitors ALL ECS clusters in the region. Every time any ECS task reaches
+  RUNNING state, a Lambda function verifies its Cosign signature. Unsigned
+  containers are automatically stopped and the team is alerted via SNS.
+  No changes to your existing ECS/ECR infrastructure required.
+
+# ─────────────────────────────────────────────────────────────
+# Parameters
+# ─────────────────────────────────────────────────────────────
+Parameters:
+
+  LambdaImageUri:
+    Type: String
+    Description: >
+      ECR URI of the cosign-verifier Lambda container image.
+      Build and push the image from the lambda/ directory first, then paste the URI here.
+      Example: 123456789012.dkr.ecr.us-east-1.amazonaws.com/cosign-verifier:latest
+    AllowedPattern: ".+"
+
+  AlertEmail:
+    Type: String
+    Description: >
+      Email address to receive alerts when an unsigned container is blocked.
+      You will receive a confirmation email from AWS after deployment — confirm it.
+    AllowedPattern: "^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$"
+    ConstraintDescription: Must be a valid email address.
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment tag (used for naming resources).
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [7, 14, 30, 60, 90]
+    Description: Number of days to retain Lambda logs in CloudWatch.
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 10
+    MaxValue: 300
+    Description: Lambda function timeout in seconds.
+
+  LambdaMemory:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024]
+    Description: Lambda function memory in MB.
+
+# ─────────────────────────────────────────────────────────────
+# Resources
+# ─────────────────────────────────────────────────────────────
+Resources:
+
+  # ── SNS Topic for alerts ───────────────────────────────────
+  AlertSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "cosign-ecs-alerts-${Environment}"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+      Tags:
+        - Key: Project
+          Value: cosign-ecs-verify
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── CloudWatch Log Group ───────────────────────────────────
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/cosign-ecs-verifier-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ── IAM Role for Lambda ────────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "cosign-verifier-lambda-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CosignVerifierPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Stop and describe tasks across all clusters in the account/region
+              - Effect: Allow
+                Action:
+                  - ecs:StopTask
+                  - ecs:DescribeTasks
+                Resource: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/*"
+              # Publish SNS alerts
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertSNSTopic
+              # ECR access — cosign needs to pull .sig manifests from app repos
+              - Effect: Allow
+                Action:
+                  - ecr:*
+                Resource: "*"
+              # Write logs
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt LambdaLogGroup.Arn
+      Tags:
+        - Key: Project
+          Value: cosign-ecs-verify
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Lambda Function (container image) ─────────────────────
+  CosignVerifierLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      FunctionName: !Sub "cosign-ecs-verifier-${Environment}"
+      Description: >
+        Verifies Cosign signatures on ECS container images at task launch
+        across all ECS clusters in the region. Stops unsigned containers
+        and sends SNS alerts.
+      PackageType: Image
+      Code:
+        ImageUri: !Ref LambdaImageUri
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemory
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref AlertSNSTopic
+          ENVIRONMENT: !Ref Environment
+      Tags:
+        - Key: Project
+          Value: cosign-ecs-verify
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── EventBridge Rule — watches ALL clusters in region ──────
+  ECSTaskStateChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "cosign-ecs-task-verify-${Environment}"
+      Description: >
+        Triggers cosign verifier Lambda whenever any ECS task reaches
+        RUNNING state across all clusters in the region.
+      EventPattern:
+        source:
+          - aws.ecs
+        detail-type:
+          - ECS Task State Change
+        detail:
+          lastStatus:
+            - RUNNING
+      State: ENABLED
+      Targets:
+        - Id: CosignVerifierLambdaTarget
+          Arn: !GetAtt CosignVerifierLambda.Arn
+
+  # ── Permission: EventBridge → Lambda ──────────────────────
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CosignVerifierLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ECSTaskStateChangeRule.Arn
+
+# ─────────────────────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────────────────────
+Outputs:
+
+  LambdaFunctionName:
+    Description: Cosign verifier Lambda function name
+    Value: !Ref CosignVerifierLambda
+
+  LambdaFunctionArn:
+    Description: Cosign verifier Lambda function ARN
+    Value: !GetAtt CosignVerifierLambda.Arn
+
+  SNSTopicArn:
+    Description: SNS Topic ARN — confirm your email subscription to receive alerts
+    Value: !Ref AlertSNSTopic
+
+  CloudWatchLogGroup:
+    Description: CloudWatch Log Group for Lambda logs
+    Value: !Ref LambdaLogGroup
+
+  EventBridgeRuleArn:
+    Description: EventBridge rule ARN watching all ECS clusters in the region
+    Value: !GetAtt ECSTaskStateChangeRule.Arn
+
+  Coverage:
+    Description: Scope of this deployment
+    Value: !Sub "All ECS clusters in ${AWS::Region} (account: ${AWS::AccountId})"
+
+  NextSteps:
+    Description: What to do after deployment
+    Value: >
+      1. Confirm your SNS email subscription (check your inbox).
+      2. Sign your container images: cosign sign --key cosign.key <image-uri>
+      3. Run an ECS task and check CloudWatch logs to confirm verification.
