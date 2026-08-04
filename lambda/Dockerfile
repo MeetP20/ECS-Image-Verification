@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-ARG COSIGN_VERSION=v2.4.1
+ARG COSIGN_VERSION=v2.5.3
 
 RUN apt-get update && \
     apt-get install -y curl ca-certificates && \
