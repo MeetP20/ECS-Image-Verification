@@ -1,0 +1,8 @@
+lambda_name      = "ecs-image-verifier"
+lambda_image_uri = "123456789012.dkr.ecr.ap-south-1.amazonaws.com/ecs-image-verifier:v1.0.0"
+sns_topic_name   = "ecs-image-verification-alerts"
+email            = "security@example.com"
+region           = "ap-south-1"
+
+# Empty list = monitor all ECS clusters in this region/account.
+cluster_arns = []
